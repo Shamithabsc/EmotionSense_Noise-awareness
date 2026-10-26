@@ -20,6 +20,9 @@ import streamlit as st
 # ── project imports ──────────────────────────────────────────────────────────
 from config import MODEL_DIR, OUTPUT_DIR, SAMPLE_RATE
 from predict import predict_file
+from src.noise import add_white_noise_at_snr
+from src.preprocessing import (load_audio, extract_svm_features,
+                                extract_mfcc_with_deltas, extract_mfcc)
 
 # ── page config must be first Streamlit call ─────────────────────────────────
 st.set_page_config(
@@ -209,8 +212,23 @@ def model_ready() -> bool:
             and (MODEL_DIR / "label_mapping.json").exists())
 
 
+def svm_ready() -> bool:
+    return ((MODEL_DIR / "svm_model.pkl").exists()
+            and (MODEL_DIR / "svm_scaler.pkl").exists()
+            and (MODEL_DIR / "svm_label_mapping.json").exists())
+
+
+def improved_ready() -> bool:
+    return ((MODEL_DIR / "improved_cnn_lstm.keras").exists()
+            and (MODEL_DIR / "improved_label_mapping.json").exists())
+
+
 def evaluation_ready() -> bool:
     return (OUTPUT_DIR / "noise_evaluation_metrics.csv").exists()
+
+
+def comparison_ready() -> bool:
+    return (OUTPUT_DIR / "all_models_comparison.csv").exists()
 
 
 def waveform_fig(audio: np.ndarray, sr: int) -> plt.Figure:
@@ -303,13 +321,21 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigate",
-        ["🎤  Analyze Audio", "📊  Noise Robustness", "ℹ️  Setup Guide"],
+        ["🎤  Analyze Audio", "🔬  Noise Demo",
+         "📊  Noise Robustness", "📈  Model Comparison",
+         "ℹ️  Setup Guide"],
         label_visibility="collapsed",
     )
     st.markdown("---")
+    _models_avail = []
+    if model_ready():    _models_avail.append("CNN-LSTM")
+    if svm_ready():      _models_avail.append("SVM")
+    if improved_ready(): _models_avail.append("Improved")
     st.markdown(
-        '<p style="font-size:0.75rem;color:#4a5568;line-height:1.5;">'
-        "EmotionSense Studio<br>CNN-LSTM · RAVDESS · Local CPU<br>Academic mini-project</p>",
+        f'<p style="font-size:0.75rem;color:#4a5568;line-height:1.7;">'
+        f"EmotionSense Studio<br>"
+        f"Models: {', '.join(_models_avail) or 'none'}<br>"
+        f"RAVDESS · Local CPU<br>Academic mini-project</p>",
         unsafe_allow_html=True,
     )
 
@@ -318,9 +344,11 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ready = model_ready()
+_n_models = sum([model_ready(), svm_ready(), improved_ready()])
 _cls = "status-ready" if _ready else "status-missing"
 _dot_extra = "" if _ready else " status-dot-pulse"
-_msg = "Model ready — predictions enabled" if _ready else "No trained model — run python train.py"
+_msg = (f"{_n_models} model(s) ready — predictions enabled" if _ready
+        else "No trained model — run python train.py")
 
 st.markdown(
     f"""<div class="hero-banner">
@@ -654,3 +682,278 @@ data/ravdess/Actor_02/...</pre>
     for name, ok in status_items:
         icon = "✅" if ok else "❌"
         st.markdown(f"{icon} &nbsp; **{name}**", unsafe_allow_html=True)
+    st.markdown("### Additional models")
+    extra_items = [
+        ("SVM model",               (MODEL_DIR / "svm_model.pkl").exists()),
+        ("Improved CNN-LSTM",       (MODEL_DIR / "improved_cnn_lstm.keras").exists()),
+        ("Model comparison CSV",    (OUTPUT_DIR / "all_models_comparison.csv").exists()),
+    ]
+    for name, ok in extra_items:
+        icon = "✅" if ok else "⬜"
+        st.markdown(f"{icon} &nbsp; {name}", unsafe_allow_html=True)
+    st.markdown(
+        '<p style="font-size:0.8rem;color:#4a5568;margin-top:0.8rem;">'
+        "Run <code>python train_svm.py</code> and <code>python evaluate_all.py</code> "
+        "to generate all comparison artifacts.</p>",
+        unsafe_allow_html=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE — NOISE DEMO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif "🔬" in page or "Noise Demo" in page:
+    st.markdown("## 🔬 Interactive Noise Demo")
+    st.markdown(
+        '<p style="color:#9ba6c2;font-size:0.9rem;margin-top:-0.5rem;margin-bottom:1.4rem;">'
+        "Upload a speech file, choose a noise level, and see how predictions change "
+        "under synthetic additive white noise. This simulates a controlled SNR experiment — "
+        "not a model of real-world background noise."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    if not model_ready():
+        st.warning("Original CNN-LSTM model not found. Run `python train.py` first.")
+        st.stop()
+
+    uploaded_demo = st.file_uploader(
+        "Upload a WAV / MP3 / FLAC file for the noise demo",
+        type=["wav", "mp3", "flac", "ogg"],
+        key="noise_demo_upload",
+        label_visibility="collapsed",
+    )
+
+    if uploaded_demo:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(uploaded_demo.read())
+            demo_path = tmp.name
+
+        try:
+            demo_audio, demo_sr = librosa.load(demo_path, sr=SAMPLE_RATE, mono=True)
+        except Exception as exc:
+            st.error(f"Could not load audio: {exc}")
+            st.stop()
+
+        st.markdown('<div class="es-sep"></div>', unsafe_allow_html=True)
+
+        # SNR selector
+        snr_choice = st.select_slider(
+            "Noise level (SNR)",
+            options=["Clean (no noise)", "20 dB SNR (mild)", "10 dB SNR (moderate)", "0 dB SNR (heavy)"],
+            value="Clean (no noise)",
+        )
+        snr_map = {
+            "Clean (no noise)": None,
+            "20 dB SNR (mild)": 20,
+            "10 dB SNR (moderate)": 10,
+            "0 dB SNR (heavy)": 0,
+        }
+        chosen_snr = snr_map[snr_choice]
+
+        import soundfile as sf
+        col_clean, col_noisy = st.columns(2)
+
+        # Clean column
+        with col_clean:
+            st.markdown("#### 🔵 Clean audio")
+            st.audio(demo_path, format="audio/wav")
+            with st.spinner("Predicting (clean)…"):
+                clean_result = predict_file(demo_path)
+            em_c   = clean_result["predicted_emotion"]
+            conf_c = clean_result["softmax_confidence"]
+            st.markdown(
+                f'<div class="es-card" style="min-height:120px;">'
+                f'<div class="es-card-title">Prediction</div>'
+                f'<span style="font-size:1.6rem;font-weight:700;color:#f0f4ff;">'
+                f'{EMOTION_EMOJIS.get(em_c,"")} {em_c.capitalize()}</span><br>'
+                f'<span style="color:#7c6af7;font-weight:600;">{conf_c*100:.1f}% confidence</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Noisy column
+        with col_noisy:
+            if chosen_snr is None:
+                st.markdown("#### ⚪ Same as clean (no noise selected)")
+                st.info("Select a noise level above to see the effect.")
+            else:
+                st.markdown(f"#### 🔴 Noisy audio — {snr_choice}")
+                noisy_audio = add_white_noise_at_snr(demo_audio, snr_db=chosen_snr, seed=42)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as ntmp:
+                    sf.write(ntmp.name, noisy_audio, SAMPLE_RATE)
+                    noisy_path = ntmp.name
+                st.audio(noisy_path, format="audio/wav")
+                with st.spinner(f"Predicting ({chosen_snr} dB)…"):
+                    noisy_result = predict_file(noisy_path)
+                em_n   = noisy_result["predicted_emotion"]
+                conf_n = noisy_result["softmax_confidence"]
+                changed = em_n != em_c
+                border_color = "#ef4444" if changed else "#22c55e"
+                st.markdown(
+                    f'<div class="es-card" style="min-height:120px;border-color:{border_color};">'
+                    f'<div class="es-card-title">Prediction</div>'
+                    f'<span style="font-size:1.6rem;font-weight:700;color:#f0f4ff;">'
+                    f'{EMOTION_EMOJIS.get(em_n,"")} {em_n.capitalize()}</span><br>'
+                    f'<span style="color:#7c6af7;font-weight:600;">{conf_n*100:.1f}% confidence</span><br>'
+                    + (f'<span style="color:#ef4444;font-weight:600;font-size:0.85rem;">'
+                       f'⚠ Emotion changed! ({em_c} → {em_n})</span>'
+                       if changed else
+                       f'<span style="color:#22c55e;font-size:0.85rem;">✓ Same prediction</span>')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown(
+            '<p style="font-size:0.75rem;color:#4a5568;margin-top:1rem;">'
+            "⚠ Synthetic AWGN is a controlled approximation. It does not model "
+            "babble, music, reverberation, or environmental noise. "
+            "This demo runs the original CNN-LSTM only.</p>",
+            unsafe_allow_html=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE — MODEL COMPARISON
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif "📈" in page or "Model Comparison" in page:
+    st.markdown("## 📈 Model Comparison")
+    st.markdown(
+        '<p style="color:#9ba6c2;font-size:0.9rem;margin-top:-0.5rem;margin-bottom:1.4rem;">'
+        "Held-out test set evaluation across all trained models and noise conditions. "
+        "All results use the same 5 test actors (IDs 10, 16, 17, 19, 20) "
+        "never seen during training or model selection."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    comp_path = OUTPUT_DIR / "all_models_comparison.csv"
+    if not comp_path.exists():
+        st.markdown(
+            '<div class="setup-box">'
+            "<h3>⏳ Comparison not yet generated</h3>"
+            "<p>Run the full model comparison with:</p>"
+            "<pre>python train_svm.py          # SVM baseline\n"
+            "python train_improved.py     # Improved CNN-LSTM\n"
+            "python evaluate_all.py       # Compare all models</pre>"
+            "<p>Only the models that exist will be evaluated.</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        comp_df = pd.read_csv(comp_path)
+        MODEL_LABEL_ORDER = ["Original CNN-LSTM", "SVM Baseline", "Improved CNN-LSTM"]
+        cond_order  = ["clean", "snr_20db", "snr_10db", "snr_0db"]
+        cond_labels = {"clean": "Clean", "snr_20db": "20 dB SNR",
+                       "snr_10db": "10 dB SNR", "snr_0db": "0 dB SNR"}
+
+        # Summary tiles — best model per condition
+        st.markdown("### Best model per noise condition (test accuracy)")
+        tile_cols = st.columns(len(cond_order))
+        for col, cond in zip(tile_cols, cond_order):
+            sub = comp_df[comp_df["condition"] == cond]
+            if sub.empty:
+                continue
+            best_row = sub.loc[sub["accuracy"].idxmax()]
+            with col:
+                st.metric(
+                    label=cond_labels[cond],
+                    value=f"{best_row['accuracy']*100:.1f}%",
+                    help=f"Best: {best_row['model']}",
+                )
+
+        st.markdown('<div class="es-sep"></div>', unsafe_allow_html=True)
+
+        t_table, t_charts, t_cm = st.tabs(
+            ["📋  Full Results Table", "📊  Comparison Charts", "🔷  Confusion Matrices"]
+        )
+
+        with t_table:
+            display = comp_df.copy()
+            display["condition"] = display["condition"].map(
+                lambda c: cond_labels.get(c, c))
+            rename = {
+                "model": "Model", "condition": "Condition",
+                "n_test_files": "N", "accuracy": "Accuracy",
+                "macro_precision": "Precision", "macro_recall": "Recall",
+                "macro_f1": "Macro F1",
+                "accuracy_delta_vs_clean": "ΔAcc",
+                "macro_f1_delta_vs_clean": "ΔF1",
+            }
+            display = display.rename(columns={k: v for k, v in rename.items()
+                                              if k in display.columns})
+            for col in ["Accuracy", "Precision", "Recall", "Macro F1"]:
+                if col in display.columns:
+                    display[col] = display[col].map(lambda x: f"{float(x)*100:.1f}%")
+            for col in ["ΔAcc", "ΔF1"]:
+                if col in display.columns:
+                    display[col] = display[col].map(lambda x: f"{float(x)*100:+.1f}%")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.caption(
+                "ΔAcc/ΔF1 = change relative to clean condition for the same model. "
+                "All results are on the held-out test set (300 files)."
+            )
+
+        with t_charts:
+            for metric, metric_label in [("accuracy", "Accuracy"), ("macro_f1", "Macro F1")]:
+                img_path = OUTPUT_DIR / f"{metric}_comparison.png"
+                if img_path.exists():
+                    st.image(str(img_path), caption=f"{metric_label} comparison",
+                             use_container_width=True)
+                else:
+                    # Generate inline
+                    models_in_data = [m for m in MODEL_LABEL_ORDER
+                                      if m in comp_df["model"].values]
+                    colors = ["#4c72b0", "#55a868", "#c44e52"]
+                    x = np.arange(len(cond_order))
+                    width = 0.8 / max(len(models_in_data), 1)
+                    with plt.rc_context(MPL_STYLE):
+                        fig, ax = plt.subplots(figsize=(10, 4))
+                        for i, (mdl, color) in enumerate(zip(models_in_data, colors)):
+                            sub = comp_df[comp_df["model"] == mdl].set_index("condition")
+                            vals = [float(sub.loc[c, metric]) if c in sub.index else float("nan")
+                                    for c in cond_order]
+                            bars = ax.bar(x + (i - len(models_in_data)/2 + 0.5) * width,
+                                          vals, width=width*0.9, label=mdl,
+                                          color=color, edgecolor="none")
+                            for bar, v in zip(bars, vals):
+                                if not np.isnan(v):
+                                    ax.text(bar.get_x() + bar.get_width()/2, v + 0.01,
+                                            f"{v:.2f}", ha="center", va="bottom",
+                                            fontsize=7, color="#f0f4ff")
+                        ax.set_xticks(x)
+                        ax.set_xticklabels([cond_labels.get(c, c) for c in cond_order])
+                        ax.set_ylim(0, 1.05)
+                        ax.set_ylabel(metric_label)
+                        ax.set_title(f"{metric_label} — Model Comparison")
+                        ax.legend(fontsize=9)
+                        ax.grid(axis="y", linestyle="--", alpha=0.4)
+                        fig.tight_layout()
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+
+        with t_cm:
+            model_keys_avail = comp_df["model_key"].unique().tolist()
+            model_labels_avail = comp_df["model"].unique().tolist()
+            col_m, col_c = st.columns(2)
+            with col_m:
+                sel_model_key = st.selectbox(
+                    "Model", options=model_keys_avail,
+                    format_func=lambda k: comp_df.loc[comp_df["model_key"]==k, "model"].iloc[0],
+                    key="cm_model_sel",
+                )
+            with col_c:
+                sel_cond = st.selectbox(
+                    "Condition", options=cond_order,
+                    format_func=lambda c: cond_labels.get(c, c),
+                    key="cm_cond_sel",
+                )
+            cm_img = OUTPUT_DIR / f"{sel_model_key}_confusion_matrix_{sel_cond}.png"
+            if cm_img.exists():
+                st.image(str(cm_img), use_container_width=True,
+                         caption=f"Confusion matrix — {comp_df.loc[comp_df['model_key']==sel_model_key,'model'].iloc[0]} / {cond_labels.get(sel_cond, sel_cond)}")
+            else:
+                st.info(f"Confusion matrix not found. Run `python evaluate_all.py`.")
+
