@@ -9,6 +9,8 @@ from config import SAMPLE_RATE, N_MFCC, MAX_FRAMES
 N_MFCC_DELTA = N_MFCC * 3  # 120 when N_MFCC=40
 # Feature dimension for the SVM baseline: mean + std + min + max per coefficient
 SVM_FEATURE_DIM = N_MFCC * 4  # 160 when N_MFCC=40
+# Log-Mel spectrogram number of mel bands
+LOG_MEL_N_MELS = 64  # matches mel bank used in MFCCs (n_mels=64); input becomes (200, 64, 1)
 
 
 def load_audio(path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
@@ -146,3 +148,53 @@ def audio_quality(audio: np.ndarray) -> dict:
         "clipping_fraction": clipping_fraction,
         "silence_like": bool(rms < 1e-4),
     }
+
+
+def extract_log_mel(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    n_mels: int = LOG_MEL_N_MELS,
+    max_frames: int = MAX_FRAMES,
+) -> np.ndarray:
+    """Return a fixed-size (max_frames, n_mels, 1) log-Mel spectrogram tensor.
+
+    Uses identical STFT parameters (n_fft=512, hop_length=160) and the same
+    padding/truncation and per-recording normalisation as extract_mfcc(), ensuring
+    a fair feature comparison. Input shape (200, 64, 1) is compatible with the
+    existing CNN-LSTM architecture.
+
+    Notes
+    -----
+    - n_mels=64 matches the mel filter bank used inside extract_mfcc(), so the
+      spectral resolution is identical.
+    - The model must be retrained for log-Mel features; do NOT load MFCC
+      checkpoints for inference with this function (shape mismatch: 64 vs 40).
+    """
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        raise ValueError("Cannot extract log-Mel features from empty audio.")
+    if np.max(np.abs(audio)) < 1e-8:
+        return np.zeros((max_frames, n_mels, 1), dtype=np.float32)
+
+    mel = librosa.feature.melspectrogram(
+        y=audio,
+        sr=sample_rate,
+        n_fft=512,
+        hop_length=160,
+        n_mels=n_mels,
+        fmax=8000,
+    )  # shape: (n_mels, frames)
+    log_mel = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
+
+    # Pad or truncate to max_frames
+    if log_mel.shape[1] < max_frames:
+        log_mel = np.pad(log_mel, ((0, 0), (0, max_frames - log_mel.shape[1])), mode="constant")
+    else:
+        log_mel = log_mel[:, :max_frames]
+
+    # Per-recording normalisation (mean=0, std=1 per mel band) — same convention as MFCC
+    mean = log_mel.mean(axis=1, keepdims=True)
+    std  = log_mel.std(axis=1,  keepdims=True)
+    log_mel = (log_mel - mean) / np.maximum(std, 1e-6)
+
+    return log_mel.T[..., np.newaxis].astype(np.float32)  # (max_frames, n_mels, 1)

@@ -223,6 +223,11 @@ def improved_ready() -> bool:
             and (MODEL_DIR / "improved_label_mapping.json").exists())
 
 
+def logmel_ready() -> bool:
+    return ((MODEL_DIR / "logmel_cnn_lstm.keras").exists()
+            and (MODEL_DIR / "logmel_label_mapping.json").exists())
+
+
 def evaluation_ready() -> bool:
     return (OUTPUT_DIR / "noise_evaluation_metrics.csv").exists()
 
@@ -331,6 +336,7 @@ with st.sidebar:
     if model_ready():    _models_avail.append("CNN-LSTM")
     if svm_ready():      _models_avail.append("SVM")
     if improved_ready(): _models_avail.append("Improved")
+    if logmel_ready():   _models_avail.append("Log-Mel")
     st.markdown(
         f'<p style="font-size:0.75rem;color:#4a5568;line-height:1.7;">'
         f"EmotionSense Studio<br>"
@@ -344,7 +350,7 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ready = model_ready()
-_n_models = sum([model_ready(), svm_ready(), improved_ready()])
+_n_models = sum([model_ready(), svm_ready(), improved_ready(), logmel_ready()])
 _cls = "status-ready" if _ready else "status-missing"
 _dot_extra = "" if _ready else " status-dot-pulse"
 _msg = (f"{_n_models} model(s) ready — predictions enabled" if _ready
@@ -444,10 +450,17 @@ streamlit run app.py</pre>
                                         {emotion.capitalize()}</div>
                                     <div style="font-size:1.1rem;color:#7c6af7;font-weight:600;">
                                         {conf*100:.1f}% softmax confidence</div>
+                                    <div style="font-size:0.75rem;color:#8892b0;margin-top:3px;">
+                                        Model: Original CNN-LSTM · Features: MFCC-40 (40 MFCCs × 200 timeframes)
+                                    </div>
                                 </div>
                             </div>
                             <div class="es-card-title" style="margin-top:0.8rem;">Class probabilities</div>
                             {probability_bars_html(result["class_probabilities"])}
+                            {f'<div style="margin-top:0.7rem;padding:0.5rem 0.8rem;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.3);border-radius:8px;font-size:0.78rem;color:#f59e0b;">⚠️ Low confidence ({conf*100:.1f}%) — below 30% heuristic baseline (random guess across 8 classes is 12.5%). The model is uncertain about this clip.</div>' if conf < 0.30 else ''}
+                            <div style="margin-top:0.8rem;padding-top:0.6rem;border-top:1px solid rgba(255,255,255,0.06);font-size:0.72rem;color:#8892b0;line-height:1.4;">
+                                💬 <em>Ethical Note: This prediction is a statistical estimate based on acoustic features and actor recordings. It does not establish a person's true internal emotional state or clinical mood.</em>
+                            </div>
                         </div>""",
                         unsafe_allow_html=True,
                     )
@@ -548,7 +561,7 @@ elif "📊" in page:
 
         st.markdown('<div class="es-sep"></div>', unsafe_allow_html=True)
 
-        t1, t2, t3 = st.tabs(["📈  Charts", "🔢  Full Metrics Table", "🔷  Confusion Matrices"])
+        t1, t2, t3, t4 = st.tabs(["📈  Charts", "🔢  Full Metrics Table", "🔷  Confusion Matrices", "🌐  Extended Multi-Noise"])
 
         with t1:
             c_left, c_right = st.columns(2)
@@ -636,6 +649,30 @@ elif "📊" in page:
                     {c: "{:.3f}" for c in num_cols}, na_rep="—"),
                     use_container_width=True)
 
+        with t4:
+            st.markdown("### Multi-Noise Type Evaluation (AWGN, Pink Noise, 50 Hz Hum)")
+            st.markdown(
+                '<p style="color:#9ba6c2;font-size:0.85rem;">'
+                "Evaluating models across diverse acoustic degradation profiles: Additive White Gaussian Noise (AWGN), "
+                "Pink Noise (1/f power falloff simulating office/acoustic noise), and 50 Hz Mains Hum (fundamental + harmonics). "
+                "All tests evaluated on the held-out 5 test actors (300 files)."
+                "</p>",
+                unsafe_allow_html=True,
+            )
+            ext_path = OUTPUT_DIR / "extended_noise_comparison.csv"
+            if ext_path.exists():
+                ext_df = pd.read_csv(ext_path)
+                st.dataframe(ext_df, use_container_width=True, hide_index=True)
+                col_acc, col_f1 = st.columns(2)
+                acc_img = OUTPUT_DIR / "snr_accuracy_extended.png"
+                f1_img = OUTPUT_DIR / "snr_f1_extended.png"
+                if acc_img.exists():
+                    col_acc.image(str(acc_img), caption="Accuracy vs SNR across noise types", use_container_width=True)
+                if f1_img.exists():
+                    col_f1.image(str(f1_img), caption="Macro-F1 vs SNR across noise types", use_container_width=True)
+            else:
+                st.info("Extended evaluation not yet run. Execute: `python evaluate_extended.py`")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PAGE 3 — SETUP GUIDE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -684,9 +721,11 @@ data/ravdess/Actor_02/...</pre>
         st.markdown(f"{icon} &nbsp; **{name}**", unsafe_allow_html=True)
     st.markdown("### Additional models")
     extra_items = [
-        ("SVM model",               (MODEL_DIR / "svm_model.pkl").exists()),
-        ("Improved CNN-LSTM",       (MODEL_DIR / "improved_cnn_lstm.keras").exists()),
-        ("Model comparison CSV",    (OUTPUT_DIR / "all_models_comparison.csv").exists()),
+        ("SVM model",                   (MODEL_DIR / "svm_model.pkl").exists()),
+        ("Improved CNN-LSTM (MFCC+Δ)",  (MODEL_DIR / "improved_cnn_lstm.keras").exists()),
+        ("Log-Mel CNN-LSTM (LogMel-64)",(MODEL_DIR / "logmel_cnn_lstm.keras").exists()),
+        ("Model comparison CSV",        (OUTPUT_DIR / "all_models_comparison.csv").exists()),
+        ("Extended multi-noise CSV",    (OUTPUT_DIR / "extended_noise_comparison.csv").exists()),
     ]
     for name, ok in extra_items:
         icon = "✅" if ok else "⬜"
