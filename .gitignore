@@ -7,3 +7,4 @@ data/ravdess/
 models/*.keras
 outputs/*
 !outputs/README.md
+/data

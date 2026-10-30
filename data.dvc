@@ -1,0 +1,6 @@
+outs:
+- md5: 3e61d85a263f7f3f7677384882120ced.dir
+  size: 590349859
+  nfiles: 1441
+  hash: md5
+  path: data
