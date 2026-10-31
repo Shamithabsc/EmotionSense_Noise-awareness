@@ -11,6 +11,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    env:
+      PYTHONPATH: .:./src
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,6 +29,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verify Python import paths
+        run: |
+          python -c "import sys; print('\n'.join(sys.path))"
+          python -c "import src; import config; print('Imports successful')"
+
       - name: Run automated tests
         run: |
-          pytest -v
+          python -m pytest -v
