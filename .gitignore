@@ -8,3 +8,10 @@ models/*.keras
 outputs/*
 !outputs/README.md
 /data
+
+# MLflow local tracking
+mlruns/
+mlartifacts/
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
