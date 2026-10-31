@@ -1,0 +1,27 @@
+﻿apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emotionsense
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: emotionsense
+  template:
+    metadata:
+      labels:
+        app: emotionsense
+    spec:
+      containers:
+        - name: emotionsense
+          image: emotionsense:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8501
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"

@@ -1,0 +1,3 @@
+﻿-r requirements.txt
+pytest>=8.0
+mlflow==3.17.2
