@@ -27,8 +27,8 @@ from sklearn.utils.class_weight import compute_class_weight
 from config import DATA_DIR, OUTPUT_DIR, MODEL_DIR, RANDOM_SEED
 from src.dataset import discover_ravdess
 from src.preprocessing import load_audio, extract_mfcc_with_deltas
-from src.model import build_cnn_lstm
-from src.noise import add_white_noise_at_snr
+from src.model import build_improved_cnn_bilstm
+from src.noise import add_white_noise_at_snr, add_pink_noise_at_snr
 
 # ── Model save paths (separate from original baseline) ────────────────────────
 IMPROVED_MODEL  = MODEL_DIR / "improved_cnn_lstm.keras"
@@ -49,25 +49,88 @@ def load_split() -> tuple[list[int], list[int], list[int]]:
     return s["train"], s["validation"], s["test"]
 
 
-def load_features(frame: pd.DataFrame, encoder: LabelEncoder,
-                  augment: bool = False, aug_prob: float = 0.5,
-                  snr_min: float = 5.0, snr_max: float = 30.0,
-                  seed_offset: int = 0) -> tuple[np.ndarray, np.ndarray, list]:
-    """Extract delta-MFCC features, optionally adding online noise augmentation."""
+def apply_spec_augment(feat: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Apply time and frequency masking to (max_frames, n_features, 1) tensor."""
+    f = feat.copy()
+    frames, n_feats, _ = f.shape
+    # Time masking: zero out 1-2 random time strips
+    for _ in range(rng.integers(1, 3)):
+        w = rng.integers(6, 16)
+        if frames > w:
+            t = rng.integers(0, frames - w)
+            f[t:t+w, :, :] = 0.0
+    # Frequency masking: zero out 1-2 random coefficient strips
+    for _ in range(rng.integers(1, 3)):
+        w = rng.integers(6, 16)
+        if n_feats > w:
+            freq = rng.integers(0, n_feats - w)
+            f[:, freq:freq+w, :] = 0.0
+    return f
+
+
+def load_clean_features(frame: pd.DataFrame, encoder: LabelEncoder) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Extract clean delta-MFCC features for validation or test sets without augmentation."""
     X, y, kept = [], [], []
-    rng = np.random.default_rng(RANDOM_SEED + seed_offset)
-    for i, row in enumerate(frame.itertuples(index=False)):
+    for row in frame.itertuples(index=False):
         try:
             audio = load_audio(row.path)
-            if augment and rng.random() < aug_prob:
-                snr = float(rng.uniform(snr_min, snr_max))
-                audio = add_white_noise_at_snr(audio, snr_db=snr, seed=RANDOM_SEED + i)
             feat = extract_mfcc_with_deltas(audio)
             X.append(feat)
             y.append(encoder.transform([row.emotion])[0])
             kept.append(row.path)
         except Exception as exc:
             print(f"  Skipping {Path(row.path).name}: {exc}")
+    if not X:
+        raise ValueError("No usable features extracted.")
+    return np.stack(X), np.asarray(y, dtype=np.int64), kept
+
+
+def load_augmented_train_features(
+    frame: pd.DataFrame, encoder: LabelEncoder, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Extract training features with 4-fold dataset expansion:
+    
+    1. 100% clean recordings
+    2. Additive White Gaussian Noise (AWGN at SNR 12–26 dB)
+    3. Additive Pink Noise (1/f spectral attenuation at SNR 12–26 dB)
+    4. SpecAugment masked copies (time and frequency strips)
+    This quadruples training diversity without corrupting clean samples.
+    """
+    X, y, kept = [], [], []
+    for i, row in enumerate(frame.itertuples(index=False)):
+        try:
+            audio = load_audio(row.path)
+            clean_feat = extract_mfcc_with_deltas(audio)
+            label_idx = encoder.transform([row.emotion])[0]
+
+            # 1. Clean feature
+            X.append(clean_feat)
+            y.append(label_idx)
+            kept.append(row.path)
+
+            # 2. Additive White Gaussian Noise
+            snr_w = float(rng.uniform(12.0, 26.0))
+            noisy_w = add_white_noise_at_snr(audio, snr_db=snr_w, seed=RANDOM_SEED + i * 3)
+            X.append(extract_mfcc_with_deltas(noisy_w))
+            y.append(label_idx)
+            kept.append(row.path)
+
+            # 3. Additive Pink Noise
+            snr_p = float(rng.uniform(12.0, 26.0))
+            noisy_p = add_pink_noise_at_snr(audio, snr_db=snr_p, seed=RANDOM_SEED + i * 5)
+            X.append(extract_mfcc_with_deltas(noisy_p))
+            y.append(label_idx)
+            kept.append(row.path)
+
+            # 4. SpecAugment masked feature
+            masked_feat = apply_spec_augment(clean_feat, rng)
+            X.append(masked_feat)
+            y.append(label_idx)
+            kept.append(row.path)
+
+        except Exception as exc:
+            print(f"  Skipping {Path(row.path).name}: {exc}")
+
     if not X:
         raise ValueError("No usable features extracted.")
     return np.stack(X), np.asarray(y, dtype=np.int64), kept
@@ -85,6 +148,7 @@ def main() -> None:
 
     labels  = sorted(df.emotion.unique())
     encoder = LabelEncoder().fit(labels)
+    num_classes = len(labels)
     print("Emotion labels:", list(encoder.classes_))
     print(f"Train: {len(train_actors)} actors | Val: {len(val_actors)} | Test: {len(test_actors)}")
 
@@ -92,15 +156,25 @@ def main() -> None:
     val_df   = df[df.actor_id.isin(val_actors)]
     test_df  = df[df.actor_id.isin(test_actors)]
 
-    print("\nExtracting training features (with noise augmentation, p=0.5, SNR 5–30 dB)…")
-    X_train, y_train, _ = load_features(train_df, encoder, augment=True, aug_prob=0.5,
-                                         snr_min=5.0, snr_max=30.0, seed_offset=0)
-    print("Extracting validation features (clean)…")
-    X_val,   y_val,   _ = load_features(val_df,   encoder, augment=False)
-    print("Extracting test features (clean)…")
-    X_test,  y_test, test_paths = load_features(test_df, encoder, augment=False)
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    print("\nExtracting training features with 4-fold dataset expansion (Clean + AWGN + Pink + SpecAugment)…")
+    X_train, y_train, _ = load_augmented_train_features(train_df, encoder, rng)
+    print("Extracting validation features (strictly clean, unaugmented)…")
+    X_val,   y_val,   _ = load_clean_features(val_df, encoder)
+    print("Extracting test features (strictly clean, held-out)…")
+    X_test,  y_test, test_paths = load_clean_features(test_df, encoder)
 
     print(f"\nX_train: {X_train.shape}  X_val: {X_val.shape}  X_test: {X_test.shape}")
+
+    # One-hot encoding for label smoothing
+    y_train_cat = tf.keras.utils.to_categorical(y_train, num_classes)
+    y_val_cat   = tf.keras.utils.to_categorical(y_val, num_classes)
+
+    # Shuffle training set
+    perm = rng.permutation(len(X_train))
+    X_train = X_train[perm]
+    y_train_cat = y_train_cat[perm]
 
     # ── Class weights (handles neutral having fewer samples) ───────────────
     cw_vals = compute_class_weight("balanced", classes=np.arange(len(labels)), y=y_train)
@@ -109,35 +183,34 @@ def main() -> None:
 
     # ── Model ──────────────────────────────────────────────────────────────
     input_shape = tuple(X_train.shape[1:])  # (200, 120, 1)
-    model = build_cnn_lstm(input_shape, len(labels))
-    model.optimizer.learning_rate.assign(5e-4)  # lower initial LR
+    model = build_improved_cnn_bilstm(input_shape, num_classes, learning_rate=4e-4, label_smoothing=0.08)
     model.summary()
 
     # ── Callbacks ─────────────────────────────────────────────────────────
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=15, restore_best_weights=True
+            monitor="val_accuracy", patience=16, restore_best_weights=True
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=0
+            monitor="val_loss", factor=0.5, patience=4, min_lr=1e-5, verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             str(IMPROVED_MODEL),
-            monitor="val_accuracy", save_best_only=True, verbose=0
+            monitor="val_accuracy", save_best_only=True, verbose=1
         ),
     ]
 
     history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=80,
-        batch_size=16,
+        X_train, y_train_cat,
+        validation_data=(X_val, y_val_cat),
+        epochs=70,
+        batch_size=32,
         class_weight=class_weight,
         callbacks=callbacks,
         verbose=1,
     )
 
-    # Best checkpoint already restored by EarlyStopping
+    # Save final best model & mapping
     model.save(IMPROVED_MODEL)
     with open(IMPROVED_MAP, "w", encoding="utf-8") as f:
         json.dump({str(i): str(lbl) for i, lbl in enumerate(encoder.classes_)}, f, indent=2)
@@ -166,9 +239,9 @@ def main() -> None:
         if f"val_{col}" in hist_df.columns:
             ax.plot(epochs, hist_df[f"val_{col}"], label="Val", linewidth=1.8, linestyle="--")
         ax.set_xlabel("Epoch"); ax.set_ylabel(label)
-        ax.set_title(f"Improved CNN-LSTM {label}")
+        ax.set_title(f"Improved CNN-BiLSTM {label}")
         ax.legend(); ax.grid(linestyle="--", alpha=0.4)
-    fig.suptitle("EmotionSense Improved — Learning Curves", fontsize=13)
+    fig.suptitle("EmotionSense Improved CNN-BiLSTM with Attention — Learning Curves", fontsize=13)
     fig.tight_layout()
     fig.savefig(OUTPUT_DIR / "improved_learning_curves.png", dpi=150)
     plt.close(fig)
@@ -181,3 +254,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

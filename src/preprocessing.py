@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import io
 import numpy as np
 import librosa
 
@@ -20,6 +19,47 @@ def load_audio(path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
         raise ValueError(f"Audio file is empty or unreadable: {path}")
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     return audio
+
+
+def load_audio_from_buffer(audio_source, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Load audio from file path, raw bytes, or BytesIO buffer as mono float32.
+
+    Handles:
+      - Raw bytes or BytesIO stream (e.g. from Streamlit st.audio_input)
+      - File paths / Path objects
+      - Stereo-to-mono downmixing
+      - Automatic resampling to target sample_rate (16,000 Hz)
+      - Validation against empty or invalid content
+    """
+    if audio_source is None:
+        raise ValueError("Audio source cannot be None.")
+
+    if isinstance(audio_source, (bytes, bytearray)):
+        if len(audio_source) == 0:
+            raise ValueError("Audio buffer is empty.")
+        audio_source = io.BytesIO(audio_source)
+    elif hasattr(audio_source, "getvalue"):  # Streamlit UploadedFile
+        data = audio_source.getvalue()
+        if len(data) == 0:
+            raise ValueError("Audio stream is empty.")
+        audio_source = io.BytesIO(data)
+    elif hasattr(audio_source, "read") and not hasattr(audio_source, "seek"):
+        data = audio_source.read()
+        if len(data) == 0:
+            raise ValueError("Audio stream is empty.")
+        audio_source = io.BytesIO(data)
+
+    try:
+        audio, _ = librosa.load(audio_source, sr=sample_rate, mono=True)
+    except Exception as exc:
+        raise ValueError(f"Could not decode audio stream: {exc}") from exc
+
+    if audio.size == 0:
+        raise ValueError("Decoded audio stream contains zero samples.")
+
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return audio
+
 
 
 def extract_mfcc(
@@ -87,16 +127,16 @@ def extract_mfcc_with_deltas(
     delta2 = librosa.feature.delta(mfcc, order=2)
     combined = np.concatenate([mfcc, delta1, delta2], axis=0)  # (n_mfcc*3, frames)
 
-    # Pad / truncate time axis
+    # Per-recording normalisation on actual speech frames prior to padding
+    mean = combined.mean(axis=1, keepdims=True)
+    std  = combined.std(axis=1,  keepdims=True)
+    combined = (combined - mean) / np.maximum(std, 1e-6)
+
+    # Pad / truncate time axis with true zeros
     if combined.shape[1] < max_frames:
         combined = np.pad(combined, ((0, 0), (0, max_frames - combined.shape[1])), mode="constant")
     else:
         combined = combined[:, :max_frames]
-
-    # Per-recording normalisation per coefficient (same as extract_mfcc)
-    mean = combined.mean(axis=1, keepdims=True)
-    std  = combined.std(axis=1,  keepdims=True)
-    combined = (combined - mean) / np.maximum(std, 1e-6)
 
     return combined.T[..., np.newaxis].astype(np.float32)  # (max_frames, n_mfcc*3, 1)
 
@@ -133,20 +173,67 @@ def extract_svm_features(
 
 
 def audio_quality(audio: np.ndarray) -> dict:
-    """Simple signal checks; these are indicators, not a trained noise detector."""
+    """Signal checks and heuristic quality metrics.
+
+    Note: The estimated SNR is an acoustic energy-ratio heuristic based on frame energy
+    percentiles (90th percentile speech vs 10th percentile background), not an instrument-grade
+    SNR measurement.
+    """
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
-        return {"duration_seconds": 0.0, "peak_amplitude": 0.0,
-                "clipping_fraction": 0.0, "silence_like": True}
+        return {
+            "duration_seconds": 0.0,
+            "peak_amplitude": 0.0,
+            "rms_amplitude": 0.0,
+            "clipping_fraction": 0.0,
+            "silence_like": True,
+            "estimated_noise_floor_rms": 0.0,
+            "estimated_snr_db": 0.0,
+            "quality_status": "Empty audio",
+        }
+
     peak = float(np.max(np.abs(audio)))
-    clipping_fraction = float(np.mean(np.abs(audio) >= 0.999))
+    clipping_fraction = float(np.mean(np.abs(audio) >= 0.99))
     rms = float(np.sqrt(np.mean(np.square(audio))))
+    silence_like = bool(rms < 1e-4 or peak < 1e-3)
+
+    # Frame-level RMS energy for noise floor and SNR heuristic estimation
+    frame_len = 1024
+    hop_len = 256
+    if audio.size >= frame_len:
+        # Compute sliding frame energies
+        n_frames = 1 + (audio.size - frame_len) // hop_len
+        shape = (n_frames, frame_len)
+        strides = (audio.strides[0] * hop_len, audio.strides[0])
+        frames = np.lib.stride_tricks.as_strided(audio, shape=shape, strides=strides)
+        frame_rms = np.sqrt(np.mean(np.square(frames), axis=1) + 1e-12)
+        noise_floor_rms = float(np.percentile(frame_rms, 10))
+        speech_level_rms = float(np.percentile(frame_rms, 90))
+        estimated_snr = float(np.clip(20.0 * np.log10((speech_level_rms + 1e-6) / (noise_floor_rms + 1e-6)), 0.0, 50.0))
+    else:
+        noise_floor_rms = float(rms * 0.1)
+        estimated_snr = 15.0
+
+    if silence_like:
+        quality_status = "Silent or near-silent"
+    elif clipping_fraction > 0.02:
+        quality_status = "Clipping distortion detected"
+    elif rms < 0.01:
+        quality_status = "Very quiet recording"
+    elif estimated_snr < 10.0:
+        quality_status = "High background noise"
+    else:
+        quality_status = "Good recording quality"
+
     return {
         "duration_seconds": float(audio.size / SAMPLE_RATE),
         "peak_amplitude": peak,
         "rms_amplitude": rms,
         "clipping_fraction": clipping_fraction,
-        "silence_like": bool(rms < 1e-4),
+        "silence_like": silence_like,
+        "estimated_noise_floor_rms": noise_floor_rms,
+        "estimated_snr_db": round(estimated_snr, 1),
+        "quality_status": quality_status,
     }
 
 
